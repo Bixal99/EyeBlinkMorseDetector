@@ -6,11 +6,18 @@ Requirements: opencv-python, mediapipe, numpy
 pip install opencv-python mediapipe numpy
 """
 
+import os
+import time
+from collections import deque
+
+# MediaPipe can import TensorFlow internally. With newer protobuf packages,
+# TensorFlow may crash on import unless protobuf uses the Python runtime.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import cv2
 import mediapipe as mp
 import numpy as np
-import time
-from collections import deque
 
 # ----------------------
 # Morse code dictionary
@@ -32,7 +39,6 @@ MORSE_CODE = {
     "-.-.-.": ";", "-...-": "=", ".-.-.": "+", "-....-": "-", "..--.-": "_",
     ".-..-.": "\"", "...-..-": "$", ".--.-.": "@",
     # special commands
-    "........": "[BACKSPACE]"  # 8 dots for backspace/delete
 }
 
 # ----------------------
@@ -52,7 +58,8 @@ EAR_THRESHOLD = 0.15         # typical blink threshold (you should calibrate per
 EAR_SMOOTHING = 3            # frames for rolling average of EAR (reduced for faster response)
 MIN_CONSEC_FRAMES = 1        # frames EAR must be below threshold to count as start (reduced)
 DEBOUNCE_TIME = 0.08         # min seconds between consecutive detected blinks (reduced)
-DOT_DASH_TIME = 0.3          # seconds: < -> dot, >= -> dash (reduced for easier control)
+DOT_DASH_TIME = 0.45         # seconds: < -> dot, >= -> dash (slightly longer hold for dash)
+BACKSPACE_HOLD_TIME = 3.0    # seconds: hold eyes closed in code mode to backspace
 LETTER_GAP = 1.5             # seconds of silence to mark end-of-letter
 WORD_GAP = 7.0               # seconds of silence to mark end-of-word
 MIN_BLINK_DURATION = 0.03    # ignore extremely short durations (noise) (reduced)
@@ -113,7 +120,7 @@ def morse_to_char(pattern):
     return MORSE_CODE.get(pattern, "?")
 
 def process_morse_command(pattern, decoded_message):
-    """Process morse pattern and return updated message. Handles special commands like backspace."""
+    """Process morse pattern and return updated message."""
     result = morse_to_char(pattern)
     
     if result == "[BACKSPACE]":
@@ -130,6 +137,283 @@ def process_morse_command(pattern, decoded_message):
         print(f"Letter committed: {pattern} -> {result}")
         return decoded_message
 
+# ----------------------
+# OpenCV dashboard UI
+# ----------------------
+UI_COLORS = {
+    "bg": (27, 20, 18),
+    "surface": (39, 30, 27),
+    "surface_2": (33, 25, 22),
+    "border": (74, 61, 55),
+    "border_soft": (57, 45, 40),
+    "text": (246, 240, 236),
+    "muted": (176, 162, 154),
+    "green": (160, 230, 100),
+    "green_bg": (76, 95, 49),
+    "red": (95, 92, 239),
+    "red_bg": (70, 57, 87),
+    "cyan": (238, 188, 32),
+    "cyan_bg": (83, 69, 26),
+    "yellow": (70, 220, 245),
+    "white": (255, 255, 255),
+}
+
+def draw_round_rect(img, x1, y1, x2, y2, color, radius=16, thickness=-1, line_type=cv2.LINE_AA):
+    """Draw a rounded rectangle with OpenCV primitives."""
+    radius = max(0, min(radius, abs(x2 - x1) // 2, abs(y2 - y1) // 2))
+    if thickness < 0:
+        cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, thickness, line_type)
+        cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, thickness, line_type)
+        cv2.circle(img, (x1 + radius, y1 + radius), radius, color, thickness, line_type)
+        cv2.circle(img, (x2 - radius, y1 + radius), radius, color, thickness, line_type)
+        cv2.circle(img, (x1 + radius, y2 - radius), radius, color, thickness, line_type)
+        cv2.circle(img, (x2 - radius, y2 - radius), radius, color, thickness, line_type)
+        return
+
+    cv2.line(img, (x1 + radius, y1), (x2 - radius, y1), color, thickness, line_type)
+    cv2.line(img, (x1 + radius, y2), (x2 - radius, y2), color, thickness, line_type)
+    cv2.line(img, (x1, y1 + radius), (x1, y2 - radius), color, thickness, line_type)
+    cv2.line(img, (x2, y1 + radius), (x2, y2 - radius), color, thickness, line_type)
+    cv2.ellipse(img, (x1 + radius, y1 + radius), (radius, radius), 180, 0, 90, color, thickness, line_type)
+    cv2.ellipse(img, (x2 - radius, y1 + radius), (radius, radius), 270, 0, 90, color, thickness, line_type)
+    cv2.ellipse(img, (x2 - radius, y2 - radius), (radius, radius), 0, 0, 90, color, thickness, line_type)
+    cv2.ellipse(img, (x1 + radius, y2 - radius), (radius, radius), 90, 0, 90, color, thickness, line_type)
+
+
+def draw_text(img, text, x, y, scale=0.55, color=None, thickness=1, max_width=None):
+    """Draw single-line text, trimming with ellipsis if a max width is supplied."""
+    if color is None:
+        color = UI_COLORS["text"]
+    label = str(text)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    if max_width is not None:
+        original = label
+        while label and cv2.getTextSize(label, font, scale, thickness)[0][0] > max_width:
+            label = label[:-1]
+        if label != original and len(label) > 3:
+            label = label[:-3] + "..."
+    cv2.putText(img, label, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+
+
+def draw_pill(img, x, y, text, color, bg_color, width=None, key=None):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text_width = cv2.getTextSize(text, font, 0.45, 1)[0][0]
+    pill_width = width or max(90, text_width + (62 if key else 44))
+    draw_round_rect(img, x, y, x + pill_width, y + 32, bg_color, radius=16)
+    cv2.circle(img, (x + 18, y + 16), 5, color, -1, cv2.LINE_AA)
+    draw_text(img, text, x + 32, y + 21, 0.45, UI_COLORS["text"], 1, pill_width - 40)
+    if key:
+        draw_round_rect(img, x + pill_width - 30, y + 6, x + pill_width - 8, y + 28, (59, 65, 76), radius=11)
+        draw_text(img, key, x + pill_width - 23, y + 22, 0.38, UI_COLORS["muted"], 1)
+    return pill_width
+
+
+def place_image_fit(canvas, image, x, y, width, height, fill_color):
+    """Fill a box without stretching; crop the overflow like a camera preview."""
+    canvas[y:y + height, x:x + width] = fill_color
+    src_h, src_w = image.shape[:2]
+    scale = max(width / src_w, height / src_h)
+    fitted_w = max(1, int(src_w * scale))
+    fitted_h = max(1, int(src_h * scale))
+    fitted = cv2.resize(image, (fitted_w, fitted_h), interpolation=cv2.INTER_AREA)
+    crop_x = max(0, (fitted_w - width) // 2)
+    crop_y = max(0, (fitted_h - height) // 2)
+    canvas[y:y + height, x:x + width] = fitted[crop_y:crop_y + height, crop_x:crop_x + width]
+
+
+def draw_morse_symbols(img, pattern, x, y, color):
+    if not pattern:
+        draw_text(img, "Waiting for input", x, y + 18, 0.58, UI_COLORS["muted"], 1)
+        return
+
+    cursor = x
+    for symbol in pattern[-8:]:
+        if symbol == ".":
+            cv2.circle(img, (cursor + 12, y + 14), 9, color, -1, cv2.LINE_AA)
+            cursor += 38
+        else:
+            draw_round_rect(img, cursor, y + 5, cursor + 54, y + 23, color, radius=9)
+            cursor += 72
+
+
+def draw_event_stack(img, x, y, last_blink_time, current_morse_symbol, code_mode_active, blink_active):
+    now = time.time()
+    events = []
+    if last_blink_time > 0 and (now - last_blink_time) < 1.2 and current_morse_symbol:
+        symbol = current_morse_symbol[-1]
+        events.append("Dash recorded" if symbol == "-" else "Dot recorded")
+    if blink_active:
+        events.append("Recording blink")
+    if code_mode_active:
+        events.append("Code mode ready")
+    else:
+        events.append("Natural blink guard")
+
+    for index, event in enumerate(events[:3]):
+        top = y + index * 58
+        draw_round_rect(img, x, top, x + 206, top + 46, UI_COLORS["surface_2"], radius=16)
+        draw_round_rect(img, x, top, x + 206, top + 46, UI_COLORS["border_soft"], radius=16, thickness=2)
+        cv2.circle(img, (x + 24, top + 23), 8, UI_COLORS["green"] if index != 0 else UI_COLORS["cyan"], -1, cv2.LINE_AA)
+        draw_text(img, event, x + 44, top + 29, 0.55, UI_COLORS["text"], 1, 145)
+
+
+def build_dashboard(
+    frame,
+    face_detected,
+    avg_ear,
+    ear_threshold,
+    code_mode_active,
+    pending_activation_blink,
+    blink_active,
+    current_morse_symbol,
+    decoded_message,
+    fps,
+    paused,
+    code_mode_start_time,
+    last_blink_time,
+    show_help=False,
+    debug_overlay=False,
+):
+    canvas_w, canvas_h = 1280, 820
+    canvas = np.full((canvas_h, canvas_w, 3), UI_COLORS["bg"], dtype=np.uint8)
+
+    cv2.rectangle(canvas, (0, 0), (canvas_w, 78), (24, 27, 36), -1)
+    cv2.line(canvas, (0, 78), (canvas_w, 78), UI_COLORS["border_soft"], 1, cv2.LINE_AA)
+
+    margin = 32
+    header_y = 48
+    draw_round_rect(canvas, margin, 24, canvas_w - margin, 92, UI_COLORS["surface_2"], radius=18)
+    draw_round_rect(canvas, margin, 24, canvas_w - margin, 92, UI_COLORS["border"], radius=18, thickness=2)
+    draw_text(canvas, "Eye Blink Morse Translator", 58, header_y + 12, 0.78, UI_COLORS["text"], 1)
+
+    mode_color = UI_COLORS["red"] if code_mode_active else UI_COLORS["muted"]
+    mode_bg = UI_COLORS["red_bg"] if code_mode_active else UI_COLORS["surface"]
+    mode_label = "Code Mode"
+    if pending_activation_blink and not code_mode_active:
+        mode_label = "Arming"
+        mode_color = UI_COLORS["yellow"]
+        mode_bg = UI_COLORS["cyan_bg"]
+
+    draw_pill(canvas, 922, 39, "Camera", UI_COLORS["green"], UI_COLORS["green_bg"], 98)
+    draw_pill(canvas, 1030, 39, mode_label, mode_color, mode_bg, 118)
+    draw_text(canvas, "Help", 1180, 60, 0.5, UI_COLORS["muted"], 1)
+    draw_round_rect(canvas, 1240, 40, 1262, 62, (45, 51, 64), radius=11)
+    draw_text(canvas, "H", 1247, 57, 0.38, UI_COLORS["muted"], 1)
+
+    camera_x, camera_y, camera_w, camera_h = 32, 112, 840, 500
+    trans_x, trans_y, trans_w, trans_h = 894, 112, 354, 500
+
+    draw_round_rect(canvas, camera_x, camera_y, camera_x + camera_w, camera_y + camera_h, UI_COLORS["surface"], radius=18)
+    draw_round_rect(canvas, camera_x, camera_y, camera_x + camera_w, camera_y + camera_h, UI_COLORS["border"], radius=18, thickness=2)
+    draw_text(canvas, "Camera Feed", camera_x + 24, camera_y + 40, 0.64, UI_COLORS["text"], 1)
+
+    video_x, video_y, video_w, video_h = camera_x + 20, camera_y + 62, camera_w - 40, camera_h - 82
+    draw_round_rect(canvas, video_x, video_y, video_x + video_w, video_y + video_h, (9, 11, 15), radius=10)
+    place_image_fit(canvas, frame, video_x, video_y, video_w, video_h, (9, 11, 15))
+    draw_round_rect(canvas, video_x, video_y, video_x + video_w, video_y + video_h, UI_COLORS["border_soft"], radius=10, thickness=2)
+
+    face_label = "Face" if face_detected else "No Face"
+    eyes_closed = avg_ear is not None and avg_ear < ear_threshold
+    eye_label = "Eyes Closed" if eyes_closed else "Eyes Open"
+    draw_pill(canvas, video_x + 16, video_y + 16, face_label, UI_COLORS["green"] if face_detected else UI_COLORS["red"], UI_COLORS["surface_2"], 104)
+    draw_pill(canvas, video_x + 16, video_y + 54, eye_label, UI_COLORS["red"] if eyes_closed else UI_COLORS["green"], UI_COLORS["surface_2"], 122)
+    if paused:
+        draw_pill(canvas, video_x + video_w - 118, video_y + 16, "Paused", UI_COLORS["yellow"], UI_COLORS["surface_2"], 100)
+
+    draw_round_rect(canvas, trans_x, trans_y, trans_x + trans_w, trans_y + trans_h, UI_COLORS["surface"], radius=18)
+    draw_round_rect(canvas, trans_x, trans_y, trans_x + trans_w, trans_y + trans_h, UI_COLORS["border"], radius=18, thickness=2)
+    draw_text(canvas, "Live Translation", trans_x + 28, trans_y + 44, 0.6, UI_COLORS["muted"], 1)
+
+    message = decoded_message if decoded_message else "-"
+    draw_text(canvas, message, trans_x + 28, trans_y + 114, 1.2, UI_COLORS["white"], 2, trans_w - 76)
+
+    draw_event_stack(canvas, trans_x + trans_w - 196, trans_y + 4, last_blink_time, current_morse_symbol, code_mode_active, blink_active)
+
+    draw_text(canvas, "Current Morse", trans_x + 28, trans_y + 354, 0.6, UI_COLORS["muted"], 1)
+    draw_morse_symbols(canvas, current_morse_symbol, trans_x + 28, trans_y + 392, UI_COLORS["cyan"])
+
+    if code_mode_active:
+        timeout_remaining = max(0.0, CODE_MODE_TIMEOUT - (time.time() - code_mode_start_time))
+        status = f"Listening - timeout in {timeout_remaining:.1f}s"
+        status_color = UI_COLORS["red"]
+    elif pending_activation_blink:
+        status = "Activation pending - blink again"
+        status_color = UI_COLORS["yellow"]
+    else:
+        status = "Normal mode - double blink to activate"
+        status_color = UI_COLORS["muted"]
+    draw_text(canvas, status, trans_x + 28, trans_y + 448, 0.48, status_color, 1, trans_w - 54)
+
+    status_y = 632
+    draw_round_rect(canvas, margin, status_y, canvas_w - margin, status_y + 56, UI_COLORS["surface_2"], radius=16)
+    draw_round_rect(canvas, margin, status_y, canvas_w - margin, status_y + 56, UI_COLORS["border"], radius=16, thickness=2)
+    cursor = margin + 24
+    for text, color, bg, width in [
+        ("Camera", UI_COLORS["green"] if face_detected else UI_COLORS["red"], UI_COLORS["green_bg"] if face_detected else UI_COLORS["red_bg"], 100),
+        ("Face", UI_COLORS["green"] if face_detected else UI_COLORS["red"], UI_COLORS["green_bg"] if face_detected else UI_COLORS["red_bg"], 90),
+        ("Open" if not eyes_closed else "Closed", UI_COLORS["green"] if not eyes_closed else UI_COLORS["red"], UI_COLORS["green_bg"] if not eyes_closed else UI_COLORS["red_bg"], 96),
+        ("Code Mode" if code_mode_active else "Normal", mode_color, mode_bg, 112),
+        (f"{fps:.0f} FPS", UI_COLORS["cyan"], UI_COLORS["cyan_bg"], 96),
+        (f"EAR {avg_ear:.3f}", UI_COLORS["green"], UI_COLORS["green_bg"], 116),
+        (f"TH {ear_threshold:.3f}", UI_COLORS["green"], UI_COLORS["green_bg"], 112),
+        ("Debug" if debug_overlay else "Clean", UI_COLORS["yellow"] if debug_overlay else UI_COLORS["muted"], UI_COLORS["cyan_bg"] if debug_overlay else UI_COLORS["surface"], 104),
+    ]:
+        cursor += draw_pill(canvas, cursor, status_y + 12, text, color, bg, width) + 10
+
+    toolbar_y = 712
+    draw_round_rect(canvas, margin, toolbar_y, canvas_w - margin, toolbar_y + 86, UI_COLORS["surface_2"], radius=16)
+    draw_round_rect(canvas, margin, toolbar_y, canvas_w - margin, toolbar_y + 86, UI_COLORS["border"], radius=16, thickness=2)
+    actions = [
+        ("Reset", "R", 110),
+        ("Save", "S", 104),
+        ("Calibrate", "C", 126),
+        ("Auto", "T", 104),
+        ("Help", "H", 104),
+        ("Pause", "P", 112),
+        ("Mode", "M", 104),
+        ("Debug", "D", 112),
+        ("Quit", "Q", 96),
+    ]
+    action_x = margin + 24
+    for label, key, width in actions:
+        draw_round_rect(canvas, action_x, toolbar_y + 20, action_x + width, toolbar_y + 66, UI_COLORS["surface"], radius=10)
+        draw_round_rect(canvas, action_x, toolbar_y + 20, action_x + width, toolbar_y + 66, UI_COLORS["border"], radius=10, thickness=2)
+        draw_text(canvas, label, action_x + 18, toolbar_y + 50, 0.5, UI_COLORS["text"], 1, width - 50)
+        draw_round_rect(canvas, action_x + width - 32, toolbar_y + 30, action_x + width - 10, toolbar_y + 56, (58, 65, 76), radius=11)
+        draw_text(canvas, key, action_x + width - 25, toolbar_y + 49, 0.38, UI_COLORS["muted"], 1)
+        action_x += width + 12
+
+    if not face_detected:
+        draw_round_rect(canvas, video_x + 176, video_y + 128, video_x + video_w - 176, video_y + 210, UI_COLORS["surface_2"], radius=14)
+        draw_round_rect(canvas, video_x + 176, video_y + 128, video_x + video_w - 176, video_y + 210, UI_COLORS["red_bg"], radius=14, thickness=2)
+        draw_text(canvas, "No face detected", video_x + 226, video_y + 162, 0.78, UI_COLORS["white"], 2)
+        draw_text(canvas, "Center yourself in the camera", video_x + 214, video_y + 192, 0.5, UI_COLORS["muted"], 1)
+
+    if show_help:
+        overlay = canvas.copy()
+        help_x, help_y, help_w, help_h = 360, 184, 560, 340
+        draw_round_rect(overlay, help_x, help_y, help_x + help_w, help_y + help_h, (19, 22, 29), radius=18)
+        cv2.addWeighted(overlay, 0.88, canvas, 0.12, 0, canvas)
+        draw_round_rect(canvas, help_x, help_y, help_x + help_w, help_y + help_h, UI_COLORS["border"], radius=18, thickness=2)
+        draw_text(canvas, "Keyboard Help", help_x + 30, help_y + 48, 0.82, UI_COLORS["white"], 2)
+        help_items = [
+            "Q  Quit application",
+            "R  Reset message",
+            "S  Save message",
+            "P  Pause detection",
+            "M  Toggle code mode",
+            "C  Calibrate threshold",
+            "T  Auto-adjust threshold",
+            "Hold eyes closed 3s  Backspace",
+            "D  Toggle face mesh overlay",
+            "Up / Down  Adjust threshold",
+        ]
+        for index, item in enumerate(help_items):
+            row_y = help_y + 92 + index * 28
+            draw_text(canvas, item, help_x + 42, row_y, 0.54, UI_COLORS["text"], 1)
+        draw_text(canvas, "Press H to close", help_x + 330, help_y + help_h - 26, 0.42, UI_COLORS["muted"], 1)
+
+    return canvas
 # ----------------------
 # Main loop
 # ----------------------
@@ -175,6 +459,7 @@ def main(camera_index=0, target_width=640, target_height=480):
     blink_active = False
     consecutive_below = 0
     blink_start_time = None
+    long_close_backspace_done = False
     last_blink_time = 0
     last_signal_time = 0  # time of last dot or dash detected
     suppress_word_gap_until = 0  # suppress auto-space briefly after backspace
@@ -190,6 +475,8 @@ def main(camera_index=0, target_width=640, target_height=480):
     decoded_message = ""       # readable text
 
     paused = False
+    help_visible = False
+    debug_overlay = False
 
     # FPS calculation
     last_frame_time = time.time()
@@ -233,8 +520,7 @@ def main(camera_index=0, target_width=640, target_height=480):
                 ear_buffer.append(ear_value)
                 avg_ear = float(np.mean(ear_buffer)) if ear_buffer else ear_value
 
-                # Draw face mesh and small markers for the 6 key points per eye (for debug)
-                if mp_drawing is not None:
+                if debug_overlay and mp_drawing is not None:
                     mp_drawing.draw_landmarks(
                         image=frame,
                         landmark_list=face_landmarks,
@@ -243,44 +529,30 @@ def main(camera_index=0, target_width=640, target_height=480):
                         connection_drawing_spec=mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
                     )
 
-                # Draw the six selected points per eye and label them with better visualization
-                # Right eye points (red)
-                for i, idx in enumerate(RIGHT_EYE_IDX):
-                    pt = coords[idx]
-                    cv2.circle(frame, pt, 3, (0, 0, 255), -1)  # Red for right eye
-                    cv2.circle(frame, pt, 5, (0, 0, 255), 1)   # Outer circle
-                
-                # Left eye points (blue)
-                for i, idx in enumerate(LEFT_EYE_IDX):
-                    pt = coords[idx]
-                    cv2.circle(frame, pt, 3, (255, 0, 0), -1)  # Blue for left eye
-                    cv2.circle(frame, pt, 5, (255, 0, 0), 1)   # Outer circle
-                
-                # Draw eye bounding boxes for better visualization
-                right_eye_pts = [coords[idx] for idx in RIGHT_EYE_IDX]
-                left_eye_pts = [coords[idx] for idx in LEFT_EYE_IDX]
-                
-                # Right eye bounding box
-                if all(pt for pt in right_eye_pts):
-                    right_x_coords = [pt[0] for pt in right_eye_pts]
-                    right_y_coords = [pt[1] for pt in right_eye_pts]
-                    cv2.rectangle(frame, 
-                                (min(right_x_coords)-10, min(right_y_coords)-10),
-                                (max(right_x_coords)+10, max(right_y_coords)+10),
-                                (0, 0, 255), 1)
-                    cv2.putText(frame, f"R: {ear_r:.3f}", (min(right_x_coords), min(right_y_coords)-15), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-                
-                # Left eye bounding box
-                if all(pt for pt in left_eye_pts):
-                    left_x_coords = [pt[0] for pt in left_eye_pts]
-                    left_y_coords = [pt[1] for pt in left_eye_pts]
-                    cv2.rectangle(frame, 
-                                (min(left_x_coords)-10, min(left_y_coords)-10),
-                                (max(left_x_coords)+10, max(left_y_coords)+10),
-                                (255, 0, 0), 1)
-                    cv2.putText(frame, f"L: {ear_l:.3f}", (min(left_x_coords), min(left_y_coords)-15), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+                    for idx in RIGHT_EYE_IDX:
+                        pt = coords[idx]
+                        cv2.circle(frame, pt, 3, (0, 0, 255), -1)
+                        cv2.circle(frame, pt, 5, (0, 0, 255), 1)
+
+                    for idx in LEFT_EYE_IDX:
+                        pt = coords[idx]
+                        cv2.circle(frame, pt, 3, (255, 0, 0), -1)
+                        cv2.circle(frame, pt, 5, (255, 0, 0), 1)
+
+                    right_eye_pts = [coords[idx] for idx in RIGHT_EYE_IDX]
+                    left_eye_pts = [coords[idx] for idx in LEFT_EYE_IDX]
+
+                    if all(pt for pt in right_eye_pts):
+                        right_x_coords = [pt[0] for pt in right_eye_pts]
+                        right_y_coords = [pt[1] for pt in right_eye_pts]
+                        cv2.rectangle(frame, (min(right_x_coords) - 10, min(right_y_coords) - 10), (max(right_x_coords) + 10, max(right_y_coords) + 10), (0, 0, 255), 1)
+                        cv2.putText(frame, f"R: {ear_r:.3f}", (min(right_x_coords), min(right_y_coords) - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+
+                    if all(pt for pt in left_eye_pts):
+                        left_x_coords = [pt[0] for pt in left_eye_pts]
+                        left_y_coords = [pt[1] for pt in left_eye_pts]
+                        cv2.rectangle(frame, (min(left_x_coords) - 10, min(left_y_coords) - 10), (max(left_x_coords) + 10, max(left_y_coords) + 10), (255, 0, 0), 1)
+                        cv2.putText(frame, f"L: {ear_l:.3f}", (min(left_x_coords), min(left_y_coords) - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
 
                 # -------------------------
                 # Blink detection state machine with Code Mode
@@ -298,14 +570,38 @@ def main(camera_index=0, target_width=640, target_height=480):
                     blink_active = True
                     blink_start_time = now
 
+                # Long close in code mode is a deliberate backspace gesture.
+                if (
+                    code_mode_active
+                    and blink_active
+                    and blink_start_time is not None
+                    and not long_close_backspace_done
+                    and (now - blink_start_time) >= BACKSPACE_HOLD_TIME
+                ):
+                    if current_morse_symbol:
+                        current_morse_symbol = ""
+                        print("Pending Morse sequence cleared by long eye close")
+                    if decoded_message:
+                        decoded_message = decoded_message[:-1]
+                        print("BACKSPACE executed: eyes closed for 3 seconds -> removed last character")
+                    else:
+                        print("BACKSPACE ignored: eyes closed for 3 seconds -> message already empty")
+                    long_close_backspace_done = True
+                    last_signal_time = now
+                    last_blink_time = now
+                    code_mode_start_time = now
+                    suppress_word_gap_until = now + 1.0
+
                 # End of blink: EAR goes back above threshold while blink was active
                 if blink_active and (avg_ear >= EAR_THRESHOLD):
                     blink_end_time = now
                     blink_active = False
+                    was_long_close_backspace = long_close_backspace_done
+                    long_close_backspace_done = False
                     duration = blink_end_time - (blink_start_time or blink_end_time)
 
                     # Debounce: ignore blinks that are too close in time or too short/long
-                    if (now - last_blink_time) > DEBOUNCE_TIME and MIN_BLINK_DURATION <= duration <= MAX_BLINK_DURATION:
+                    if (not was_long_close_backspace) and (now - last_blink_time) > DEBOUNCE_TIME and MIN_BLINK_DURATION <= duration <= MAX_BLINK_DURATION:
                         
                         # Check if we're in code mode or trying to activate it
                         if not code_mode_active:
@@ -356,18 +652,8 @@ def main(camera_index=0, target_width=640, target_height=480):
                 if code_mode_active:
                     # If we have not had any new blink for letter gap, commit current symbol
                     if current_morse_symbol and (time.time() - last_signal_time > LETTER_GAP):
-                        # Identify if this symbol is a BACKSPACE command
-                        is_backspace_cmd = (current_morse_symbol == "........") or (
-                            MORSE_CODE.get(current_morse_symbol) == "[BACKSPACE]"
-                        )
-                        # Process morse command (handles backspace and regular characters)
                         decoded_message = process_morse_command(current_morse_symbol, decoded_message)
                         current_morse_symbol = ""
-                        if is_backspace_cmd:
-                            # Prevent immediate re-adding of a space due to word-gap logic
-                            suppress_word_gap_until = time.time() + 1.0
-                            # Also reset last_signal_time so gap timers start fresh
-                            last_signal_time = time.time()
 
                     # Word gap: if no signal for WORD_GAP, add a space (if last char not space)
                     if (
@@ -386,173 +672,97 @@ def main(camera_index=0, target_width=640, target_height=480):
                 avg_ear = float(np.mean(ear_buffer)) if ear_buffer else 1.0
                 # Optionally reset transient blink state if face gone
                 blink_active = False
+                long_close_backspace_done = False
                 consecutive_below = 0
                 # note: we do not clear current morse or message — user may want to continue
 
             # -------------------------
-            # Draw UI overlays
+            # Draw dashboard UI
             # -------------------------
-            # Main status box (larger)
-            cv2.rectangle(frame, (0, 0), (w, 160), (0, 0, 0), -1)
-            alpha = 0.7
-            overlay = frame.copy()
-            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
-            # Helper function for text
-            def add_text(text, y, color=(255,255,255), scale=0.7, thickness=1):
-                cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
-            
-            def add_large_text(text, y, color=(255,255,255), scale=1.2, thickness=2):
-                cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
-
-            # Title
-            add_text("Eye Blink Morse Detector (Double-blink to activate code mode)", 18)
-            
-            # Code mode status (very prominent)
-            if code_mode_active:
-                mode_text = "🔴 CODE MODE ACTIVE"
-                mode_color = (0, 0, 255)  # Red
-                timeout_remaining = CODE_MODE_TIMEOUT - (time.time() - code_mode_start_time)
-                timeout_text = f" (Timeout: {timeout_remaining:.1f}s)"
-            elif pending_activation_blink:
-                mode_text = "⚡ ACTIVATION PENDING - Blink again!"
-                mode_color = (0, 255, 255)  # Yellow
-                timeout_text = ""
-            else:
-                mode_text = "🟢 NORMAL MODE - Double-blink to activate"
-                mode_color = (0, 255, 0)  # Green
-                timeout_text = ""
-            
-            add_large_text(mode_text + timeout_text, 35, mode_color)
-            
-            # Large decoded message display
-            add_large_text(f"DECODED MESSAGE: {decoded_message}", 65, (100, 255, 100))
-            
-            # Current morse pattern (only show in code mode)
-            if code_mode_active and current_morse_symbol:
-                add_text(f"Current Pattern: {current_morse_symbol}", 95, (200, 255, 200))
-                # Show hint for special commands
-                if current_morse_symbol == "........":
-                    add_text("→ BACKSPACE ready (8 dots)", 110, (255, 255, 0))
-            elif code_mode_active:
-                add_text("Commands: ........ = Backspace | Press H for help", 95, (200, 200, 200))
-            
-            # Eye state information
-            eye_state = "CLOSED" if avg_ear and avg_ear < EAR_THRESHOLD else "OPEN"
-            eye_color = (0, 0, 255) if eye_state == "CLOSED" else (0, 255, 0)
-            add_text(f"Eyes: {eye_state} | EAR: {avg_ear:.3f} | Threshold: {EAR_THRESHOLD:.3f}", 125, eye_color)
-            
-            # Blink status
-            if code_mode_active:
-                if blink_active:
-                    blink_status = "Recording Code Blink..."
-                    blink_color = (0, 255, 255)
-                else:
-                    blink_status = "Ready for Code Blinks"
-                    blink_color = (255, 255, 255)
-            else:
-                if blink_active:
-                    blink_status = "Natural Blink (Ignored)"
-                    blink_color = (128, 128, 128)
-                else:
-                    blink_status = "Double-blink to activate code mode"
-                    blink_color = (200, 200, 200)
-            
-            add_text(f"Status: {blink_status}", 150, blink_color)
-
-            # Large output message box at bottom
-            if decoded_message:
-                msg_box_height = 80
-                cv2.rectangle(frame, (0, h - msg_box_height), (w, h), (0, 50, 0), -1)
-                overlay_bottom = frame.copy()
-                cv2.addWeighted(overlay_bottom, 0.8, frame, 0.2, 0, frame)
-                
-                # Split long messages across lines
-                words = decoded_message.split()
-                line1 = " ".join(words[:5]) if len(words) > 5 else decoded_message
-                line2 = " ".join(words[5:]) if len(words) > 5 else ""
-                
-                cv2.putText(frame, "OUTPUT:", (10, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.putText(frame, line1, (10, h - 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 255, 100), 2, cv2.LINE_AA)
-                if line2:
-                    cv2.putText(frame, line2, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 255, 100), 2, cv2.LINE_AA)
-
-            # Visual indicator for recent blink
-            if last_blink_time > 0 and (time.time() - last_blink_time) < 1.0:
-                recent_symbol = current_morse_symbol[-1] if current_morse_symbol else ""
-                if recent_symbol:
-                    symbol_text = "DOT (.)" if recent_symbol == "." else "DASH (-)" if recent_symbol == "-" else ""
-                    cv2.putText(frame, symbol_text, (w-200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3, cv2.LINE_AA)
-
-            # FPS display
             now_f = time.time()
             fps = 0.9 * fps + 0.1 * (1.0 / (now_f - last_frame_time)) if (now_f - last_frame_time) > 0 else fps
             last_frame_time = now_f
-            cv2.putText(frame, f"FPS: {fps:.1f}", (w-100, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 255), 1, cv2.LINE_AA)
 
-            # If face not detected show large warning
-            if not face_detected:
-                cv2.putText(frame, "NO FACE DETECTED!", (w//2-150, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
-                cv2.putText(frame, "Position yourself in front of camera", (w//2-200, h//2+40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-
-            cv2.imshow("Eye Blink Morse Code Detector", frame)
-
+            dashboard = build_dashboard(
+                frame=frame,
+                face_detected=face_detected,
+                avg_ear=avg_ear,
+                ear_threshold=EAR_THRESHOLD,
+                code_mode_active=code_mode_active,
+                pending_activation_blink=pending_activation_blink,
+                blink_active=blink_active,
+                current_morse_symbol=current_morse_symbol,
+                decoded_message=decoded_message,
+                fps=fps,
+                paused=paused,
+                code_mode_start_time=code_mode_start_time,
+                last_blink_time=last_blink_time,
+                show_help=help_visible,
+                debug_overlay=debug_overlay,
+            )
+            cv2.imshow("Eye Blink Morse Code Detector", dashboard)
             # -------------------------
             # Keyboard controls
             # -------------------------
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            raw_key = cv2.waitKeyEx(1)
+            key = raw_key & 0xFF
+            key_char = chr(key).lower() if 0 <= key < 256 else ""
+            if key_char == 'q':
                 break
-            elif key == ord('r'):
+            elif key_char == 'r':
                 current_morse_symbol = ""
                 decoded_message = ""
                 print("Reset message and current sequence.")
-            elif key == ord('p'):
+            elif key_char == 'p':
                 paused = not paused
                 print("Paused" if paused else "Resumed")
-            elif key == ord('m'):
+            elif key_char == 'm':
                 # Manual code mode toggle
                 code_mode_active = not code_mode_active
                 if code_mode_active:
                     code_mode_start_time = time.time()
-                    print("🔴 CODE MODE MANUALLY ACTIVATED")
+                    print("CODE MODE MANUALLY ACTIVATED")
                 else:
-                    print("🟢 CODE MODE MANUALLY DEACTIVATED")
+                    print("CODE MODE MANUALLY DEACTIVATED")
                 pending_activation_blink = None
-            elif key == ord('h'):
+            elif key_char == 'h':
+                help_visible = not help_visible
                 # Help
                 print("\n=== EYE BLINK MORSE CODE HELP ===")
-                print("🔸 Double-blink quickly to activate code mode")
-                print("🔸 Or press 'M' to manually toggle code mode")
-                print("🔸 In code mode: Short blinks = dots (.), Long blinks = dashes (-)")
-                print("🔸 Code mode auto-deactivates after 10 seconds of no blinks")
-                print("🔸 Normal blinks outside code mode are ignored")
-                print("\n� SPECIAL MORSE COMMANDS:")
-                print("🔹 ........ (8 dots) = BACKSPACE (delete last character)")
-                print("🔹 .-.- (dot-dash-dot-dash) = SPACE (add explicit space)")
-                print("\n⌨️  KEYBOARD CONTROLS:")
-                print("🔹 Q=quit, R=reset, P=pause, C=calibrate, M=toggle mode, H=help")
-                print("🔹 S=save message, T=auto-adjust threshold, ↑↓=adjust threshold")
-            elif key == ord('c'):
+                print("Double-blink quickly to activate code mode")
+                print("Or press 'M' to manually toggle code mode")
+                print("In code mode: Short blinks = dots (.), Long blinks = dashes (-)")
+                print("Code mode auto-deactivates after 10 seconds of no blinks")
+                print("Normal blinks outside code mode are ignored")
+                print("\nSPECIAL MORSE COMMANDS:")
+                print("Hold eyes closed for 3 seconds = BACKSPACE (delete last character)")
+                print(".-.- (dot-dash-dot-dash) = SPACE (add explicit space)")
+                print("\nKEYBOARD CONTROLS:")
+                print("Q=quit, R=reset, P=pause, C=calibrate, M=toggle mode, H=help")
+                print("S=save message, T=auto-adjust threshold, D=toggle face mesh, Up/Down=adjust threshold")
+            elif key_char == 'd':
+                debug_overlay = not debug_overlay
+                print("Face mesh overlay ON" if debug_overlay else "Face mesh overlay OFF")
+            elif key_char == 'c':
                 # Calibration mode
                 print(f"Current EAR: {avg_ear:.3f}, Threshold: {EAR_THRESHOLD:.3f}")
                 print("Keep your eyes OPEN and press UP arrow to increase threshold")
                 print("Close your eyes and press DOWN arrow to decrease threshold")
                 print("Current threshold works if eyes show OPEN when open, CLOSED when closed")
-            elif key == 82:  # Up arrow key
+            elif raw_key in (2490368, 65362):  # Up arrow key
                 EAR_THRESHOLD += 0.01
                 print(f"Threshold increased to: {EAR_THRESHOLD:.3f}")
-            elif key == 84:  # Down arrow key
+            elif raw_key in (2621440, 65364):  # Down arrow key
                 EAR_THRESHOLD -= 0.01
                 if EAR_THRESHOLD < 0.05:
                     EAR_THRESHOLD = 0.05
                 print(f"Threshold decreased to: {EAR_THRESHOLD:.3f}")
-            elif key == ord('t'):
+            elif key_char == 't':
                 # Quick threshold adjustment based on current EAR
                 if avg_ear:
                     EAR_THRESHOLD = avg_ear - 0.02
                     print(f"Auto-adjusted threshold to: {EAR_THRESHOLD:.3f} (based on current EAR)")
-            elif key == ord('s'):
+            elif key_char == 's':
                 # Save current message to file
                 if decoded_message:
                     with open("morse_output.txt", "a", encoding="utf-8") as f:
@@ -560,7 +770,6 @@ def main(camera_index=0, target_width=640, target_height=480):
                     print(f"Saved message to morse_output.txt: {decoded_message}")
                 else:
                     print("No message to save")
-
     finally:
         # cleanup
         cap.release()
