@@ -268,7 +268,7 @@ The dashboard is arranged like a control surface: large camera preview on the le
 | Eye Blink Morse Translator                         [Camera] [Code Mode] [Help] |
 +--------------------------------------------------------------------------------+
 |                                |                                               |
-|  Camera Feed                   |  Live Translation                              |
+|  Camera Feed                   |  Live Translation                             |
 |  +--------------------------+  |  +-----------------------------------------+  |
 |  | Face / Eyes pills        |  |  | Decoded text                            |  |
 |  |                          |  |  | Recent blink events                     |  |
@@ -279,7 +279,7 @@ The dashboard is arranged like a control surface: large camera preview on the le
 +--------------------------------------------------------------------------------+
 | [Camera] [Face] [Open/Closed] [Mode] [FPS] [EAR] [TH] [Clean/Debug]            |
 +--------------------------------------------------------------------------------+
-| [Reset R] [Save S] [Calibrate C] [Auto T] [Help H] [Pause P] [Mode M] [D] [Q] |
+| [Reset R] [Save S] [Calibrate C] [Auto T] [Help H] [Pause P] [Mode M] [D] [Q]  |
 +--------------------------------------------------------------------------------+
 ```
 
